@@ -1,0 +1,7 @@
+/result
+/result-*
+/.direnv/
+/.venv/
+__pycache__/
+.pytest_cache/
+/.ai/
