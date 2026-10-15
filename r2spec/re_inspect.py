@@ -126,8 +126,12 @@ def _observe(path: Path) -> tuple[os.stat_result, str, bytes]:
         after = os.fstat(fd)
     finally:
         os.close(fd)
-    if _stamp(after) != _stamp(before) or total != before.st_size:
+    if _stamp(after) != _stamp(before):
         raise InspectError("failed", "target changed while it was being hashed")
+    if total != before.st_size:
+        raise InspectError(
+            "failed", "TARGET size does not match the bytes read; it is not a stable regular file",
+        )
     return before, digest.hexdigest(), header
 
 

@@ -1,10 +1,11 @@
 """Explicit, independent r2spec modes for ``python -m r2spec``.
 
-This module imports only argparse and sys. The RE inspect handler imports the
-RE stack lazily, so help and the clean-room refusal never load the transport,
-start radare2 or touch the filesystem.
+This module imports only the standard library. The RE inspect handler imports
+the RE stack lazily, so help and the clean-room refusal never load the
+transport, start radare2 or touch the filesystem.
 """
 import argparse
+import os
 import sys
 
 EXIT_OK = 0
@@ -48,7 +49,14 @@ def _re_inspect(args: argparse.Namespace) -> int:
     except re_inspect.InspectError as error:
         _report(error.kind, str(error))
         return _EXITS[error.kind]
-    print(_printable(evidence))
+    try:
+        print(_printable(evidence), flush=True)
+    except OSError:
+        # Evidence is already published; a closed stdout must not turn success
+        # into failure, including the interpreter's final flush at shutdown.
+        devnull = os.open(os.devnull, os.O_WRONLY)
+        os.dup2(devnull, sys.stdout.fileno())
+        os.close(devnull)
     return EXIT_OK
 
 

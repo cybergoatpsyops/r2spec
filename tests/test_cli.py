@@ -327,6 +327,20 @@ def test_re_inspect_invalid_target_or_out_parent_exit_2(dirs, case):
     assert not pid_file.exists()
 
 
+def test_re_inspect_unstable_size_target_refused_accurately(dirs):
+    fake_path, pid_file = fake_r2(dirs, GOOD)
+    result = run_cli(
+        dirs, "re", "inspect", "/proc/version", "--out", dirs.outputs / "evidence", path=fake_path,
+    )
+    assert result.returncode == 1
+    assert messages(result.stderr) == [
+        "r2spec: failed: TARGET size does not match the bytes read; "
+        "it is not a stable regular file; no evidence was published",
+    ]
+    assert_nothing_published(dirs, result)
+    assert not pid_file.exists()
+
+
 def test_re_inspect_missing_r2_exit_4_publishes_nothing(dirs):
     result = run_cli(
         dirs, "re", "inspect", dirs.sample, "--out", dirs.outputs / "evidence", path=empty_path(dirs),
@@ -421,6 +435,29 @@ def test_re_inspect_write_failure_rolls_back(dirs):
     [message] = messages(result.stderr)
     assert message.startswith("r2spec: failed: File too large")
     assert_nothing_published(dirs, result)
+    assert_gone(pid_file)
+
+
+@pytest.mark.parametrize("unbuffered", [False, True], ids=["buffered", "unbuffered"])
+def test_re_inspect_closed_stdout_after_commit_still_exits_0(dirs, unbuffered):
+    fake_path, pid_file = fake_r2(dirs, GOOD)
+    out = dirs.outputs / "evidence"
+    command, env = invocation(dirs, ["re", "inspect", dirs.sample, "--out", out], fake_path)
+    if unbuffered:
+        env["PYTHONUNBUFFERED"] = "1"
+    process = subprocess.Popen(
+        command, env=env, cwd=dirs.cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+    )
+    process.stdout.close()  # The reader is gone before the CLI prints the evidence path.
+    try:
+        _, stderr = process.communicate(timeout=30)
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.communicate()
+    assert process.returncode == 0, stderr
+    assert stderr == ""
+    assert published_path(out).is_file()
     assert_gone(pid_file)
 
 
