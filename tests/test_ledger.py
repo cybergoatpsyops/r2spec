@@ -711,6 +711,11 @@ NESTED_DAMAGE = {
     "closed without closure": lambda record: record.update(closure=None),
     "closure result out of range": lambda record: record["closure"].update(result=5),
     "closure disposition changed": lambda record: record["closure"].update(disposition="assumed"),
+    "closed result flipped to fail": lambda record: record["results"][0].update(outcome="fail"),
+    "closure inputs rewritten": lambda record: record["closure"]["inputs"].update(tests="tests-9"),
+    "later result at closure inputs": lambda record: record["results"].append(
+        {**record["results"][0], "outcome": "fail", "recorded_at": 99},
+    ),
     "evidence hash not hex": lambda record: record["evidence"]["E1"].update(sha256="xyz"),
     "inspect evidence without target": lambda record: record["evidence"]["E1"].update(target_sha256=None),
     "unknown without reason": lambda record: record.update(unknowns=[{"field": "x"}]),
@@ -719,6 +724,20 @@ NESTED_DAMAGE = {
         state="pending", closure=None, coverage=None, results=[],
     ),
 }
+
+
+def test_closure_on_an_earlier_result_after_inputs_return_still_loads(tmp_path):
+    built = build(tmp_path, "passed")
+    revision = ledger.change(built.dir, "configuration", "flake-2", reason="try", expect_revision=built.revision)
+    revision = ledger.record_result(
+        built.dir, "abi-1", outcome="fail", evidence="E1", inputs={**INPUTS, "configuration": "flake-2"},
+        expect_revision=revision,
+    )
+    revision = ledger.change(built.dir, "configuration", "flake-1", reason="back", expect_revision=revision)
+    revision = close(built.dir, revision)
+    obligation = record(built.dir)
+    assert (obligation["state"], obligation["closure"]["result"], len(obligation["results"])) == ("closed", 0, 2)
+    assert ledger.render(built.dir) == revision
 
 
 @pytest.mark.parametrize("damage", list(NESTED_DAMAGE.values()), ids=list(NESTED_DAMAGE))

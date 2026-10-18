@@ -199,13 +199,17 @@ def _result_ok(result, evidence: dict) -> bool:
 
 
 def _closure_ok(closure, results: list) -> bool:
-    return (
+    """A closure names the latest result at its inputs, and that result passed (as close() requires)."""
+    if not (
         _shape(closure, {"closed_at", "disposition", "inputs", "limitations", "rationale", "result"})
         and closure["disposition"] == "accepted" and type(closure["closed_at"]) is int
         and _inputs_ok(closure["inputs"]) and _is_text(closure["rationale"])
         and isinstance(closure["limitations"], list) and all(_is_text(text) for text in closure["limitations"])
         and type(closure["result"]) is int and 0 <= closure["result"] < len(results)
-    )
+    ):
+        return False
+    at_inputs = [index for index, result in enumerate(results) if result["inputs"] == closure["inputs"]]
+    return bool(at_inputs) and at_inputs[-1] == closure["result"] and results[closure["result"]]["outcome"] == "pass"
 
 
 def _record_problem(record: dict) -> str | None:
