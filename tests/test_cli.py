@@ -1,12 +1,15 @@
-"""Real ``python -m r2spec`` process tests for mode routing and RE inspect.
+"""Real ``python -m r2spec`` process tests for mode routing, RE inspect and the ledger.
 
 Failure modes: help or refusal importing transport, starting r2 or writing
-files; malformed arguments reaching r2; evidence published after transport,
-target, header, write or cleanup failure or interruption; non-private or
-non-repeatable evidence; missing r2 breaking help or refusal; a repeated
-interrupt breaking child cleanup. Fake executables substitute only for r2.
-In-process checks inject only OS failures that cannot be induced on demand;
-they prove exit mapping and rollback, not containment.
+files; malformed arguments reaching r2 or the ledger; evidence published after
+transport, target, header, write or cleanup failure or interruption;
+non-private or non-repeatable evidence; missing r2 breaking help or refusal; a
+repeated interrupt breaking child cleanup; a ledger route loading the RE
+stack, mapping a refusal, failure or interruption to the wrong status,
+printing raw control characters or failing on a closed stdout after its
+commit. Fake executables substitute only for r2. In-process checks inject only
+OS failures or signal timing that cannot be induced on demand; they prove exit
+mapping and rollback, not containment.
 """
 import errno
 import hashlib
@@ -20,6 +23,7 @@ import stat
 import subprocess
 import sys
 import textwrap
+import threading
 import time
 from types import SimpleNamespace
 
@@ -172,7 +176,9 @@ def test_no_mode_prints_mode_help_and_exits_2_without_side_effects(dirs):
     assert snapshot(dirs.home, dirs.cwd, dirs.targets, dirs.outputs) == before
 
 
-@pytest.mark.parametrize("args", [["-h"], ["re", "-h"], ["re", "inspect", "-h"], ["clean-room", "-h"]])
+@pytest.mark.parametrize("args", [
+    ["-h"], ["re", "-h"], ["re", "inspect", "-h"], ["clean-room", "-h"], ["ledger", "-h"], ["ledger", "close", "-h"],
+])
 def test_help_exits_0(dirs, args):
     result = run_cli(dirs, *args, path=empty_path(dirs), importtime=True)
     assert result.returncode == 0
@@ -185,6 +191,11 @@ def test_help_exits_0(dirs, args):
     ["re", "inspect", "--out", "d"], ["re", "insp", "t", "--out", "d"],
     ["re", "inspect", "t", "--ou", "d"], ["re", "inspect", "t", "--out", "d", "--extra"],
     ["clean-room", "extra"], ["clean-room", "--out", "d"],
+    ["ledger"], ["ledger", "bogus"], ["ledger", "add", "a", "--requirement", "r"],
+    ["ledger", "add", "a", "--requirement", "r", "--ledger", "d", "--expect-rev", "0"],
+    ["ledger", "show", "--ledger", "d", "--expect-revision", "1"],
+    ["ledger", "close", "a", "--ledger", "d", "--expect-revision", "1", "--accept", "--rationale", "r"],
+    ["ledger", "close", "a", "--ledger", "d", "--expect-revision", "1", "--rationale", "r", "--no-known-limitations"],
 ])
 def test_malformed_args_exit_2_without_starting_r2(dirs, args):
     fake_path, pid_file = fake_r2(dirs, GOOD)
@@ -501,3 +512,150 @@ def test_re_inspect_cleanup_pending_exits_5_in_process(dirs, monkeypatch, capsys
                 os.waitpid(pid, 0)
             except (ProcessLookupError, ChildProcessError):
                 pass
+
+
+# Ledger: owner-only commands over the stdlib-only ledger with the shared exit statuses.
+def ledger_lifecycle(dirs):
+    target_sha = hashlib.sha256(dirs.sample.read_bytes()).hexdigest()
+    evidence = dirs.targets / "evidence.json"
+    evidence.write_text(json.dumps({"schema": "r2spec.re.inspect/1", "target": {"sha256": target_sha}}))
+    test_file = dirs.targets / "test_sum.py"
+    test_file.write_text("def test_sum():\n    pass\n")
+    return [
+        ["init"],
+        ["change", "target", target_sha, "--reason", "inspected"],
+        ["change", "configuration", "flake-1", "--reason", "pinned"],
+        ["change", "specification", "spec-1", "--reason", "drafted"],
+        ["change", "tests", "tests-1", "--reason", "written"],
+        ["add", "sum-1", "--requirement", "sums the records"],
+        ["evidence", "sum-1", "E1", evidence, "--kind", "re-inspect"],
+        ["unknown", "sum-1", "overflow", "--reason", "not observable statically"],
+        ["specify", "sum-1"],
+        ["cover", "sum-1", "--test", test_file],
+        ["result", "sum-1", "--outcome", "pass", "--evidence", "E1", "--target", target_sha,
+         "--configuration", "flake-1", "--specification", "spec-1", "--tests", "tests-1"],
+        ["close", "sum-1", "--accept", "--rationale", "passes at the current inputs", "--no-known-limitations"],
+    ]
+
+
+def run_ledger(dirs, path, *args):
+    return run_cli(dirs, "ledger", *args, "--ledger", dirs.outputs / "ledger", path=path)
+
+
+def test_ledger_cli_runs_the_obligation_lifecycle(dirs):
+    path = empty_path(dirs)
+    for revision, step in enumerate(ledger_lifecycle(dirs)):
+        expect = [] if step[0] == "init" else ["--expect-revision", revision - 1]
+        result = run_ledger(dirs, path, *step, *expect)
+        assert (result.returncode, result.stdout, result.stderr) == (0, f"{revision}\n", "")
+    shown = run_ledger(dirs, path, "show", "sum-1")
+    assert (shown.returncode, shown.stderr) == (0, "")
+    obligation = json.loads(shown.stdout)
+    assert (obligation["state"], obligation["closure"]["limitations"]) == ("closed", [])
+    assert obligation["unknowns"] == [{"field": "overflow", "reason": "not observable statically"}]
+    assert json.loads(run_ledger(dirs, path, "show").stdout)["revision"] == 11
+    ledger_dir = dirs.outputs / "ledger"
+    assert stat.S_IMODE(ledger_dir.stat().st_mode) == 0o700
+    assert "### sum-1: closed" in (ledger_dir / "LEDGER.md").read_text()
+    (ledger_dir / "LEDGER.md").write_text("edited by hand")
+    assert run_ledger(dirs, path, "render").stdout == "11\n"
+    assert "### sum-1: closed" in (ledger_dir / "LEDGER.md").read_text()
+
+
+def test_ledger_cli_maps_refusals_and_failures_to_exit_statuses(dirs):
+    path = empty_path(dirs)
+    ledger_dir = dirs.outputs / "ledger"
+    assert run_ledger(dirs, path, "init").returncode == 0
+    for args, status, message in [
+        (["init"], 2, "invocation: the ledger directory already exists; name a new directory"),
+        (["add", "../a", "--requirement", "r", "--expect-revision", "0"], 2,
+         "invocation: obligation id must match [A-Za-z0-9][A-Za-z0-9._-]{0,63}"),
+        (["evidence", "a-1", "E1", dirs.sample, "--kind", "guess", "--expect-revision", "0"], 2,
+         "invocation: evidence kind must be one of re-inspect, test-result, other"),
+        (["add", "a-1", "--requirement", "r", "--expect-revision", "5"], 3,
+         "refused: stale ledger revision: expected 5, found 0"),
+        (["specify", "a-9", "--expect-revision", "0"], 3, "refused: unknown obligation a-9"),
+        (["show", "a-9"], 3, "refused: unknown obligation a-9"),
+    ]:
+        before = snapshot(dirs.outputs)
+        result = run_ledger(dirs, path, *args)
+        assert (result.returncode, result.stdout, messages(result.stderr)) == (status, "", [f"r2spec: {message}"])
+        assert snapshot(dirs.outputs) == before
+    (ledger_dir / "ledger.json").write_text("{not json")
+    result = run_ledger(dirs, path, "render")
+    assert (result.returncode, result.stdout, messages(result.stderr)) == (
+        1, "", ["r2spec: failed: corrupt ledger: ledger.json is not valid JSON"],
+    )
+
+
+def test_ledger_cli_never_prints_raw_control_characters(dirs):
+    path = empty_path(dirs)
+    hostile = "\x1b]0;owned\x07\x1b[2J\x7f"
+    assert run_ledger(dirs, path, "init").returncode == 0
+    assert run_ledger(dirs, path, "add", "a-1", "--requirement", hostile, "--expect-revision", "0").returncode == 0
+    shown = run_ledger(dirs, path, "show", "a-1")
+    assert shown.returncode == 0
+    assert json.loads(shown.stdout)["requirement"] == hostile
+    assert not set(shown.stdout) & set("\x1b\x07\x7f")
+    assert run_ledger(dirs, path, "change", "tests", hostile, "--reason", "r", "--expect-revision", "1").returncode == 0
+    refused = run_ledger(dirs, path, "change", "tests", hostile, "--reason", "r", "--expect-revision", "2")
+    assert refused.returncode == 3
+    assert not set(refused.stderr) & set("\x1b\x07\x7f")
+    assert messages(refused.stderr) == [r"r2spec: refused: tests is already \x1b]0;owned\x07\x1b[2J\x7f"]
+
+
+def test_ledger_route_never_loads_the_re_stack(dirs):
+    fake_path, pid_file = fake_r2(dirs, GOOD)
+    result = run_cli(dirs, "ledger", "init", "--ledger", dirs.outputs / "ledger", path=fake_path, importtime=True)
+    assert result.returncode == 0, result.stderr
+    assert "r2spec.ledger" in imported(result.stderr)
+    assert not imported(result.stderr) & RE_STACK
+    assert not pid_file.exists()
+
+
+def test_ledger_cli_closed_stdout_after_commit_still_exits_0(dirs):
+    path = empty_path(dirs)
+    ledger_dir = dirs.outputs / "ledger"
+    assert run_ledger(dirs, path, "init").returncode == 0
+    command, env = invocation(
+        dirs, ["ledger", "add", "a-1", "--requirement", "r", "--ledger", ledger_dir, "--expect-revision", "0"], path,
+    )
+    process = subprocess.Popen(
+        command, env=env, cwd=dirs.cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+    )
+    process.stdout.close()  # The reader is gone before the CLI prints the new revision.
+    try:
+        _, stderr = process.communicate(timeout=30)
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.communicate()
+    assert process.returncode == 0, stderr
+    assert stderr == ""
+    assert json.loads((ledger_dir / "ledger.json").read_text())["revision"] == 1
+
+
+def test_ledger_cli_interrupt_after_commit_exits_130_naming_the_revision_in_process(dirs, monkeypatch, capsys):
+    ledger_dir = dirs.outputs / "ledger"
+    assert cli.main(["ledger", "init", "--ledger", str(ledger_dir)]) == 0
+    capsys.readouterr()
+    def delivered(signum, frame):
+        raise AssertionError("SIGINT was delivered during the commit instead of being held")
+    real = os.fsync
+    def fsync(fd):
+        if stat.S_ISDIR(os.fstat(fd).st_mode):
+            signal.pthread_kill(threading.main_thread().ident, signal.SIGINT)
+        return real(fd)
+    previous = signal.signal(signal.SIGINT, delivered)
+    monkeypatch.setattr(os, "fsync", fsync)
+    try:
+        status = cli.main([
+            "ledger", "add", "a-1", "--requirement", "r", "--ledger", str(ledger_dir), "--expect-revision", "0",
+        ])
+    finally:
+        monkeypatch.setattr(os, "fsync", real)
+        signal.signal(signal.SIGINT, previous)
+    captured = capsys.readouterr()
+    assert (status, captured.out) == (130, "")
+    assert messages(captured.err) == ["r2spec: interrupted: interrupted; committed revision 1"]
+    assert json.loads((ledger_dir / "ledger.json").read_text())["revision"] == 1
