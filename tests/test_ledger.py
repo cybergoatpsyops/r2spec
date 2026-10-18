@@ -378,6 +378,18 @@ def test_close_refused_when_result_evidence_changed_or_missing(tmp_path, damage)
     assert_unchanged(built.dir, lambda: close(built.dir, built.revision), "refused", "evidence E1")
 
 
+@pytest.mark.parametrize("damage", ["rewritten", "removed", "replaced by a directory"])
+def test_close_refused_when_a_covered_test_file_changed_or_missing(tmp_path, damage):
+    built = build(tmp_path, "passed")
+    if damage == "rewritten":
+        built.test_file.write_text("def test_abi():\n    assert False\n")
+    else:
+        built.test_file.unlink()
+        if damage == "replaced by a directory":
+            built.test_file.mkdir()
+    assert_unchanged(built.dir, lambda: close(built.dir, built.revision), "refused", "covered test file")
+
+
 def test_result_at_stale_inputs_refused(tmp_path):
     built = build(tmp_path, "covered")
     for stale in ({**INPUTS, "tests": "tests-0"}, {**INPUTS, "target": OTHER_SHA}):
@@ -524,6 +536,32 @@ def test_change_with_affects_reopens_only_named_obligations(tmp_path):
     )
 
 
+def test_close_refused_when_specified_under_a_previous_specification(tmp_path):
+    built = build(tmp_path, "covered")
+    revision = ledger.add(built.dir, "abi-2", "second", expect_revision=built.revision)
+    revision = advance(built.dir, built.test_file, revision, "covered", "abi-2")
+    revision = ledger.change(
+        built.dir, "specification", "spec-2", reason="abi-2 respecified", affects=["abi-2"], expect_revision=revision,
+    )
+    current = {**INPUTS, "specification": "spec-2"}
+    revision = ledger.record_result(
+        built.dir, "abi-1", outcome="pass", evidence="E1", inputs=current, expect_revision=revision,
+    )
+    assert_unchanged(
+        built.dir, lambda: close(built.dir, revision), "refused",
+        "abi-1 was specified under a previous specification input",
+    )
+    # Respecifying under the current specification is the way to close it.
+    revision = ledger.reopen(built.dir, "abi-1", to="pending", reason="respecify", expect_revision=revision)
+    revision = ledger.specify(built.dir, "abi-1", expect_revision=revision)
+    revision = ledger.cover(built.dir, "abi-1", [built.test_file], expect_revision=revision)
+    revision = ledger.record_result(
+        built.dir, "abi-1", outcome="pass", evidence="E1", inputs=current, expect_revision=revision,
+    )
+    close(built.dir, revision)
+    assert (record(built.dir)["state"], record(built.dir)["specification"]) == ("closed", "spec-2")
+
+
 def test_owner_reopen_only_moves_down_and_keeps_what_it_clears(tmp_path):
     built = build(tmp_path, "closed")
     before = record(built.dir)
@@ -661,6 +699,44 @@ def test_corrupt_ledger_fails_and_is_never_repaired(tmp_path, damage):
         built.dir, "abi-2", "second", expect_revision=built.revision,
     ), "failed", "corrupt ledger")
     assert_unchanged(built.dir, lambda: ledger.render(built.dir), "failed", "corrupt ledger")
+
+
+NESTED_DAMAGE = {
+    "results not a list": lambda record: record.update(results="garbage"),
+    "result outcome unknown": lambda record: record["results"][0].update(outcome="skip"),
+    "result evidence unattached": lambda record: record["results"][0].update(evidence="E9"),
+    "result inputs partial": lambda record: record["results"][0]["inputs"].pop("tests"),
+    "coverage not a dict": lambda record: record.update(coverage=1),
+    "covered without coverage": lambda record: record.update(state="covered", closure=None, coverage=None),
+    "closed without closure": lambda record: record.update(closure=None),
+    "closure result out of range": lambda record: record["closure"].update(result=5),
+    "closure disposition changed": lambda record: record["closure"].update(disposition="assumed"),
+    "evidence hash not hex": lambda record: record["evidence"]["E1"].update(sha256="xyz"),
+    "inspect evidence without target": lambda record: record["evidence"]["E1"].update(target_sha256=None),
+    "unknown without reason": lambda record: record.update(unknowns=[{"field": "x"}]),
+    "blank requirement": lambda record: record.update(requirement=" "),
+    "pending with specification": lambda record: record.update(
+        state="pending", closure=None, coverage=None, results=[],
+    ),
+}
+
+
+@pytest.mark.parametrize("damage", list(NESTED_DAMAGE.values()), ids=list(NESTED_DAMAGE))
+def test_nested_corruption_fails_and_is_never_repaired(tmp_path, damage):
+    built = build(tmp_path, "closed")
+    path = built.dir / "ledger.json"
+    document = json.loads(path.read_bytes())
+    damage(document["obligations"]["abi-1"])
+    path.write_text(json.dumps(document))
+    with pytest.raises(LedgerError, match="corrupt ledger: obligation 'abi-1'") as caught:
+        ledger.load(built.dir)
+    assert caught.value.kind == "failed"
+    for call in (
+        lambda: ledger.change(built.dir, "tests", "tests-2", reason="r", expect_revision=built.revision),
+        lambda: ledger.reopen(built.dir, "abi-1", to="pending", reason="r", expect_revision=built.revision),
+        lambda: ledger.render(built.dir),
+    ):
+        assert_unchanged(built.dir, call, "failed", "corrupt ledger")
 
 
 # Single writer and atomic replacement.

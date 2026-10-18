@@ -159,6 +159,90 @@ def _check_location(directory, roots) -> None:
             raise _refused(f"the ledger directory is inside forbidden root {root}")
 
 
+def _is_text(value) -> bool:
+    return isinstance(value, str) and bool(value.strip())
+
+
+def _is_sha(value) -> bool:
+    return isinstance(value, str) and _SHA256.fullmatch(value) is not None
+
+
+def _is_path(value) -> bool:
+    return isinstance(value, str) and os.path.isabs(value)
+
+
+def _shape(value, keys: set) -> bool:
+    return isinstance(value, dict) and set(value) == keys
+
+
+def _inputs_ok(value) -> bool:
+    return _shape(value, set(INPUTS)) and all(_is_text(item) for item in value.values())
+
+
+def _evidence_ok(entry) -> bool:
+    if not _shape(entry, {"confidence", "kind", "path", "schema", "sha256", "target_sha256"}):
+        return False
+    if entry["kind"] == "re-inspect":
+        bound = entry["schema"] == INSPECT_SCHEMA and _is_sha(entry["target_sha256"])
+    else:
+        bound = entry["kind"] in EVIDENCE_KINDS and entry["schema"] is None and entry["target_sha256"] is None
+    return bound and entry["confidence"] == "observed" and _is_path(entry["path"]) and _is_sha(entry["sha256"])
+
+
+def _result_ok(result, evidence: dict) -> bool:
+    return (
+        _shape(result, {"confidence", "evidence", "inputs", "outcome", "recorded_at"})
+        and result["confidence"] == "reported" and isinstance(result["evidence"], str)
+        and result["evidence"] in evidence and _inputs_ok(result["inputs"])
+        and result["outcome"] in OUTCOMES and type(result["recorded_at"]) is int
+    )
+
+
+def _closure_ok(closure, results: list) -> bool:
+    return (
+        _shape(closure, {"closed_at", "disposition", "inputs", "limitations", "rationale", "result"})
+        and closure["disposition"] == "accepted" and type(closure["closed_at"]) is int
+        and _inputs_ok(closure["inputs"]) and _is_text(closure["rationale"])
+        and isinstance(closure["limitations"], list) and all(_is_text(text) for text in closure["limitations"])
+        and type(closure["result"]) is int and 0 <= closure["result"] < len(results)
+    )
+
+
+def _record_problem(record: dict) -> str | None:
+    """Name the first problem in one obligation's fields or their fit with its state."""
+    level = STATES.index(record["state"])
+    evidence, coverage, results = record["evidence"], record["coverage"], record["results"]
+    if not _is_text(record["requirement"]):
+        return "requirement is not text"
+    if not (record["specification"] is None if level < 1 else _is_text(record["specification"])):
+        return "specification does not fit its state"
+    if not isinstance(record["unknowns"], list) or not all(
+        _shape(item, {"field", "reason"}) and _is_text(item["field"]) and _is_text(item["reason"])
+        for item in record["unknowns"]
+    ):
+        return "unknowns are malformed"
+    if not isinstance(evidence, dict) or not all(
+        _ID.fullmatch(ref) and _evidence_ok(entry) for ref, entry in evidence.items()
+    ):
+        return "evidence is malformed"
+    if level < 2:
+        if coverage is not None or results != []:
+            return "coverage or results do not fit its state"
+    elif not (
+        _shape(coverage, {"tests", "tests_input"}) and _is_text(coverage["tests_input"])
+        and isinstance(coverage["tests"], list) and coverage["tests"] and all(
+            _shape(test, {"path", "sha256"}) and _is_path(test["path"]) and _is_sha(test["sha256"])
+            for test in coverage["tests"]
+        )
+    ):
+        return "coverage is malformed"
+    if not isinstance(results, list) or not all(_result_ok(result, evidence) for result in results):
+        return "results are malformed"
+    if not (record["closure"] is None if level < 3 else _closure_ok(record["closure"], results)):
+        return "closure does not fit its state"
+    return None
+
+
 def _problem(document) -> str | None:
     """Name the first structural problem in a loaded ledger, or return None."""
     if not isinstance(document, dict) or document.get("schema") != SCHEMA:
@@ -171,7 +255,7 @@ def _problem(document) -> str | None:
     if not isinstance(inputs, dict) or set(inputs) != set(INPUTS) or not all(
         value is None or (
             isinstance(value, dict) and set(value) == {"id", "since"}
-            and isinstance(value["id"], str) and type(value["since"]) is int
+            and _is_text(value["id"]) and type(value["since"]) is int
         )
         for value in inputs.values()
     ):
@@ -187,6 +271,9 @@ def _problem(document) -> str | None:
             record["state"] not in STATES
         ):
             return f"obligation {key!r} is malformed"
+        problem = _record_problem(record)
+        if problem:
+            return f"obligation {key!r} {problem}"
     history = document["history"]
     if not isinstance(history, list) or not history or not isinstance(history[-1], dict) or (
         history[-1].get("revision") != revision
@@ -558,10 +645,11 @@ def record_result(directory, obligation_id, *, outcome, evidence, inputs, expect
 def close(directory, obligation_id, *, expect_revision, disposition, rationale, limitations) -> int:
     """Close a covered obligation on the owner's explicit acceptance.
 
-    The latest result at the current inputs must pass, its evidence must still
-    hash as attached, inspect evidence must describe the current target and the
-    coverage must be for the current tests input. limitations has no default;
-    pass [] only when there are none.
+    The latest result at the current inputs must pass, its evidence and the
+    covered test files must still hash as recorded, inspect evidence must
+    describe the current target, and the obligation must be specified and
+    covered under the current specification and tests inputs. limitations has
+    no default; pass [] only when there are none.
     """
     _check_id(obligation_id, "obligation id")
     if disposition != "accepted":
@@ -586,6 +674,12 @@ def close(directory, obligation_id, *, expect_revision, disposition, rationale, 
             )
         if record["coverage"]["tests_input"] != current["tests"]:
             raise _refused(f"coverage of {obligation_id} predates the current tests input")
+        if record["specification"] != current["specification"]:
+            raise _refused(f"{obligation_id} was specified under a previous specification input")
+        for test in record["coverage"]["tests"]:
+            _, data = _read_file(test["path"], "refused", "covered test file")
+            if _sha256(data) != test["sha256"]:
+                raise _refused(f"covered test file {test['path']} changed since it was covered")
         ref = result["evidence"]
         entry = record["evidence"][ref]
         _, data = _read_file(entry["path"], "refused", f"evidence {ref}")
